@@ -67,6 +67,54 @@
 
 ---
 
+## HE split (num_splits=2): opt vs split — SEQ_LEN=10,000, 20 emissions · 10 clones (200 states)
+
+*Compares `cscg_he_opt` (baseline) against `cscg_he_split` with num_splits=2.
+Each device shard of T//8=1250 steps is split into 2 segments of 625 steps, run in parallel via `jax.vmap`.*
+
+| Method | CPU opt (ms) | CPU split (ms) | CPU speedup | GPU opt (ms) | GPU split (ms) | GPU speedup |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|
+| `learn_viterbi_transition` | 2.3 | 63.0 | 0.02× | 33.6 | 33.4 | 1.00× |
+| `learn_em_transition` | 12.4 | 67.2 | 0.22× | 68.2 | 46.8 | **1.30×** |
+| `learn_em_emission` | 61.0 | 302.4 | 0.21× | 51.9 | 34.4 | **1.58×** |
+| `learn_viterbi_emission` | 33.1 | 169.7 | 0.17× | 38.0 | 37.7 | 1.01× |
+
+**CPU:** vmap over a batched scan adds enormous overhead on CPU — XLA cannot truly parallelize the scan iterations without wide SIMD support, and the batched scan compilation is much slower than a plain sequential scan.
+
+**GPU:** EM methods (transition + emission) benefit from halving the scan depth. Viterbi methods gain little — `learn_viterbi_transition`'s bottleneck is the scatter-add (already fast), and `learn_viterbi_emission`'s backtrace has a data-dependent sequential structure that resists batching.
+
+---
+
+## HE split (num_splits=40): original vs split — GPU only, SEQ_LEN=40,000, 20 emissions · 10 clones (200 states)
+
+*125 steps/segment per device (40,000 ÷ 8 devices ÷ 40 splits). Baseline is `cscg_he` original (no optimizations).*
+
+| Method | Original (ms) | Split-40 (ms) | Speedup |
+|--------|:---:|:---:|:---:|
+| `learn_viterbi_transition` | 245.6 | 15.0 | **16.4×** |
+| `learn_em_transition` | 243.3 | 75.2 | **3.2×** |
+| `learn_em_emission` | 253.2 | 41.2 | **6.2×** |
+| `learn_viterbi_emission` | 123.5 | 3.9 | **31.8×** |
+
+At long T the scan depth is the dominant cost. Compare with the 1M-step results below. Splitting into 40 segments reduces each device's scan from 5000 to 125 steps — the speedups scale roughly with that reduction. `learn_em_transition` gains less because its count-update scan (fused backward+counts, genuine Markov dependency) is not split and becomes the new bottleneck.
+
+---
+
+## HE split (num_splits=40): original vs split — GPU only, SEQ_LEN=1,000,000, 20 emissions · 10 clones (200 states)
+
+*3,125 steps/segment per device (1,000,000 ÷ 8 devices ÷ 40 splits). Baseline is `cscg_he` original.*
+
+| Method | Original (ms) | Split-40 (ms) | Speedup |
+|--------|:---:|:---:|:---:|
+| `learn_viterbi_transition` | 5087.5 | 111.6 | **45.6×** |
+| `learn_em_transition` | 5051.7 | 1393.1 | **3.6×** |
+| `learn_em_emission` | 3098.7 | 470.5 | **6.6×** |
+| `learn_viterbi_emission` | 2515.1 | 41.5 | **60.7×** |
+
+Speedups grow substantially vs the 40k run — scan depth scales linearly with T, so the benefit of splitting compounds. `learn_viterbi_emission` reaches 60.7× because both its forward pass and backtrace are fully split, with no unsplit sequential bottleneck. `learn_em_transition` again lags (3.6×) for the same reason as before: its fused backward+counts scan is not split and now dominates at ~1.4s.
+
+---
+
 ## Optimizations
 
 **Transition scatter (HE + SE `learn_viterbi_transition`)**

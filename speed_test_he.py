@@ -42,7 +42,6 @@ import numpy as np
 
 from cscg import cscg_he
 from cscg import cscg_he_opt
-from cscg import cscg_he_split
 from cscg import cscg_se
 from cscg import cscg_se_opt
 
@@ -57,37 +56,20 @@ BENCH_ITERS    = 6
 SEED           = 0
 
 N_CLONES = [CLONES_PER_OBS] * N_EMISSIONS
-NUM_SPLITS = 2
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_he(cls, seed=SEED, **kwargs):
-    return cls(n_clones=N_CLONES, pseudocount=1e-4, n_actions=N_ACTIONS,
-               batched=True, use_bfloat16=False, seed=seed, **kwargs)
-
-
-def make_se(cls, seed=SEED):
+def make_he(cls, seed=SEED):
     return cls(n_clones=N_CLONES, pseudocount=1e-4, n_actions=N_ACTIONS,
                batched=True, use_bfloat16=False, seed=seed)
-
 
 def make_data_he(seq_len=SEQ_LEN, seed=SEED):
     rng = np.random.default_rng(seed)
     obs = rng.integers(0, N_EMISSIONS, size=seq_len)
     act = rng.integers(0, N_ACTIONS,   size=seq_len)
-    return obs, act
-
-
-def make_data_se(seq_len=SEQ_LEN, seed=SEED):
-    # SE uses one-hot / soft observations
-    rng = np.random.default_rng(seed)
-    obs_int = rng.integers(0, N_EMISSIONS, size=seq_len)
-    obs = np.zeros((seq_len, N_EMISSIONS), dtype=np.float32)
-    obs[np.arange(seq_len), obs_int] = 1.0
-    act = rng.integers(0, N_ACTIONS, size=seq_len)
     return obs, act
 
 
@@ -127,8 +109,7 @@ def main():
     print(f"SEQ_LEN      : {SEQ_LEN:,}  |  BENCH_ITERS : {BENCH_ITERS}")
 
     he_obs, he_act = make_data_he()
-    se_obs, se_act = make_data_se()
-
+    
     # -----------------------------------------------------------------------
     # HE  (hard evidence)
     # -----------------------------------------------------------------------
@@ -165,67 +146,6 @@ def main():
           he_o.learn_viterbi_emission,
           he_p.learn_viterbi_emission,
           he_obs, he_act)
-
-    # -----------------------------------------------------------------------
-    # HE split  (sequence-split parallel forward/backward)
-    # -----------------------------------------------------------------------
-    print(f"\n{'─'*72}")
-    print(f"  HE split (num_splits={NUM_SPLITS})  —  compiling warmup …", end=" ", flush=True)
-
-    he_s = make_he(cscg_he_split.CSCG, num_splits=NUM_SPLITS)
-
-    print("done")
-    print(f"  {'method':<52}  {'opt → split ms':>22}  speedup")
-
-    bench("learn_viterbi_transition  [split fwd + backtrace]",
-          he_p.learn_viterbi_transition,
-          he_s.learn_viterbi_transition,
-          he_obs, he_act)
-
-    bench("learn_em_transition       [split fwd + bwd]",
-          he_p.learn_em_transition,
-          he_s.learn_em_transition,
-          he_obs, he_act)
-
-    bench("learn_em_emission         [split fwd + bwd]",
-          he_p.learn_em_emission,
-          he_s.learn_em_emission,
-          he_obs, he_act)
-
-    bench("learn_viterbi_emission    [split fwd + backtrace]",
-          he_p.learn_viterbi_emission,
-          he_s.learn_viterbi_emission,
-          he_obs, he_act)
-
-    # -----------------------------------------------------------------------
-    # SE  (soft evidence)
-    # -----------------------------------------------------------------------
-    print(f"\n{'─'*72}")
-    print("  SE (soft evidence)  —  compiling warmup …", end=" ", flush=True)
-
-    se_o = make_se(cscg_se.CSCG)
-    se_p = make_se(cscg_se_opt.CSCG)
-
-    print("done")
-    print(f"  {'method':<52}  {'orig → opt ms':>22}  speedup")
-
-    # learn_viterbi_transition  — opt: transition scatter + obs_liks precompute
-    bench("learn_viterbi_transition  [scatter + obs_liks precompute]",
-          se_o.learn_viterbi_transition,
-          se_p.learn_viterbi_transition,
-          se_obs, se_act)
-
-    # learn_em_transition  — opt: obs_liks precompute (scan carries remain sequential)
-    bench("learn_em_transition       [obs_liks precompute in scan]",
-          se_o.learn_em_transition,
-          se_p.learn_em_transition,
-          se_obs, se_act)
-
-    # learn_em_emission  — opt: emission matmul + obs_liks precompute
-    bench("learn_em_emission         [matmul + obs_liks precompute]",
-          se_o.learn_em_emission,
-          se_p.learn_em_emission,
-          se_obs, se_act)
 
     print()
 
