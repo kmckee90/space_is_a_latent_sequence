@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""An implementation of CSCG with hard evidence in JAX."""
+"""An implementation of CSCG with soft evidence in JAX."""
 
 from __future__ import annotations
 
@@ -25,14 +25,14 @@ import numpy as np
 import tqdm
 
 from cscg import cscg
-from cscg import cscg_he_utils as cscg_utils
+from cscg import cscg_se_utils as cscg_utils
 
 
 class CSCG(cscg.CSCG):
-  """A class implementing CSCG with hard evidence using JAX.
+  """A class implementing chmm with soft evidence using JAX.
 
   Attributes:
-    num_states: The number of latentstates.
+    num_states: The number of states in the graph.
     num_emissions: The number of unique emissions.
     emission_matrix: The emission matrix.
     counts_matrix: The counts matrix.
@@ -88,17 +88,7 @@ class CSCG(cscg.CSCG):
     else:
       self._dtype = jnp.float32
 
-    self._max_clones = max(self._n_clones)
     # Brodcast necessary variables to local devices
-
-    self._obs_to_state_start_idx = cscg_utils.bcast_local_devices(
-        np.hstack(([0], self._n_clones.cumsum())),
-        devices=self._local_devices,
-    )
-    self._masked_multiplier = cscg_utils.bcast_local_devices(
-        cscg_utils.get_masked_multiplier(self._n_clones),
-        devices=self._local_devices,
-    )
 
     self._counts_matrix = cscg_utils.bcast_local_devices(
         jax.random.uniform(
@@ -141,18 +131,14 @@ class CSCG(cscg.CSCG):
 
     self._forward_mp = jax.pmap(
         self.__forward_mp,
-        in_axes=(0, 0, 0, 0, 0, 0),
+        in_axes=(0, 0, 0, 0, 0),
         out_axes=(0, 0),
-        static_broadcasted_argnums=(6,),
     )
-
     self._backtrace = jax.pmap(
         self.__backtrace,
-        in_axes=(0, 0, 0, 0, 0, 0),
+        in_axes=(0, 0, 0, 0),
         out_axes=(0),
-        static_broadcasted_argnums=(6,),
     )
-
     self._update_transition_counts_mp = jax.pmap(
         self.__update_transition_counts_mp,
         axis_name="devices",
@@ -160,76 +146,30 @@ class CSCG(cscg.CSCG):
         out_axes=(0),
         devices=self._devices,
     )
-
     self._forward = jax.pmap(
         self.__forward,
-        in_axes=(0, 0, 0, 0, 0, 0),
+        in_axes=(0, 0, 0, 0, 0),
         out_axes=(0, 0),
-        static_broadcasted_argnums=(6,),
     )
-
     self._backward = jax.pmap(
         self.__backward,
-        in_axes=(0, 0, 0, 0, 0),
+        in_axes=(0, 0, 0, 0),
         out_axes=(0),
-        static_broadcasted_argnums=(5,),
     )
-
     self._update_transition_counts = jax.pmap(
         self.__update_transition_counts,
-        axis_name="devices",
-        in_axes=(0, 0, 0, 0, 0, 0),
-        out_axes=(0),
-        static_broadcasted_argnums=(6,),
-    )
-
-    self._update_transition_counts_given_emission = jax.pmap(
-        self.__update_transition_counts_given_emission,
         axis_name="devices",
         in_axes=(0, 0, 0, 0, 0),
         out_axes=(0),
         devices=self._devices,
     )
-
-    self._forward_emission = jax.pmap(
-        self.__forward_emission,
-        in_axes=(0, 0, 0, 0, 0),
-        out_axes=(0, 0),
-    )
-
-    self._backward_emission = jax.pmap(
-        self.__backward_emission,
-        in_axes=(0, 0, 0, 0),
-        out_axes=(0),
-    )
-
     self._update_emission_counts = jax.pmap(
         self.__update_emission_counts,
         axis_name="devices",
         in_axes=(0, 0, 0, 0),
         out_axes=(0),
-        static_broadcasted_argnums=(4,),
+        static_broadcasted_argnums=4,
         devices=self._devices,
-    )
-
-    self._update_emission_counts_mp = jax.pmap(
-        self.__update_emission_counts_mp,
-        axis_name="devices",
-        in_axes=(0, 0, 0),
-        out_axes=(0),
-        devices=self._devices,
-    )
-
-    self._forward_emission_mp = jax.pmap(
-        self.__forward_emission_mp,
-        in_axes=(0, 0, 0, 0, 0),
-        out_axes=(0, 0),
-    )
-
-    self._backtrace_emission = jax.pmap(
-        self.__backtrace_emission,
-        in_axes=(0, 0, 0, 0),
-        out_axes=(0),
     )
 
     self._transition_matrix = self._update_transition_matrix(
@@ -238,7 +178,7 @@ class CSCG(cscg.CSCG):
 
   @property
   def implementation(self) -> str:
-    return "he"
+    return "se_opt"
 
   @property
   def batched(self) -> int:
@@ -251,6 +191,10 @@ class CSCG(cscg.CSCG):
   @property
   def num_emissions(self) -> int:
     return self._num_emissions
+
+  @property
+  def emission_matrix(self) -> np.ndarray:
+    return jax.device_get(self._emission_matrix[0])
 
   @property
   def emission_matrix_default(self) -> np.ndarray:
@@ -274,13 +218,7 @@ class CSCG(cscg.CSCG):
   def n_clones(self) -> np.ndarray:
     return self._n_clones
 
-  @property
-  def n_clones_matrix(self) -> np.ndarray:
-    if self._n_clones_matrix is None:
-      raise ValueError
-    return self._n_clones_matrix
-
-  def set_counts_matrix(self, counts_matrix: np.ndarray):
+  def set_counts_matrix(self, counts_matrix: np.ndarray) -> None:
     """Set the counts matrix."""
 
     assert counts_matrix.shape == (
@@ -299,7 +237,6 @@ class CSCG(cscg.CSCG):
     )
 
   def set_pseudocount(self, pseudocount: float) -> None:
-    """Set the pseudocount."""
     assert pseudocount >= 0.0, "The pseudocount should be non-negative"
     self._pseudocount = pseudocount
     self._transition_matrix = self._update_transition_matrix(
@@ -337,12 +274,8 @@ class CSCG(cscg.CSCG):
     return n_clones_matrix
 
   def bridge(
-      self,
-      state1: int,
-      state2: int,
-      max_steps: int = 100,
-      min_prob: float = 0.0,
-  ) -> tuple[np.ndarray | jax.Array, np.ndarray | jax.Array]:
+      self, state1: int, state2: int, max_steps: int = 100
+  ) -> tuple[np.ndarray, np.ndarray]:
     """Find the path between state1 and state2."""
 
     pi_states = np.zeros(self._num_states, dtype=self._dtype)
@@ -354,14 +287,13 @@ class CSCG(cscg.CSCG):
         self._pi_actions[0],
         state2,
         max_steps,
-        min_prob,
     )
 
     s_a = self.__backtrace_all(
         self._transition_matrix[0], mess_fwd, self._pi_actions[0], state2
     )
 
-    return s_a
+    return s_a  # pytype: disable=bad-return-type  # jnp-type
 
   def sample(self, length: int) -> tuple[np.ndarray, np.ndarray]:
     """Sample observations and actions from the CHMM."""
@@ -372,7 +304,9 @@ class CSCG(cscg.CSCG):
     sample_x = np.zeros(length, dtype=int)
 
     p_a = jax.device_get(self._pi_actions[0])
-    sample_a = random_state.choice(len(p_a), size=length, p=p_a)
+    sample_a = random_state.choice(
+        len(p_a), size=length, p=p_a
+    )
     # Sample
     transition_matrix = jax.device_get(self._transition_matrix[0])
     p_h = jax.device_get(self._pi_states[0])
@@ -389,47 +323,21 @@ class CSCG(cscg.CSCG):
       emission_matrix: Optional[np.ndarray] = None,
   ):
     """Compute the log likelihood (log base 2) of a sequence of observations and actions."""
-
-    if emission_matrix is not None:
-      return self._bps_emission(observations, actions, emission_matrix)
-
     observations, actions = cscg_utils.prepare_obs_act(
         observations=observations,
         actions=actions,
+        num_emissions=self._num_emissions,
         num_devices=self._num_devices,
         devices=self._local_devices,
+        dtype=self._dtype,
         training=False,
     )
 
-    log2_lik, _ = self.__forward(
-        self._transition_matrix[0],
-        self._pi_states[0],
-        jnp.array(observations),
-        jnp.array(actions),
-        self._obs_to_state_start_idx[0],
-        self._masked_multiplier[0],
-        self._max_clones,
-    )
-    return -log2_lik.flatten()
-
-  def _bps_emission(
-      self,
-      observations: np.ndarray,
-      actions: np.ndarray,
-      emission_matrix: np.ndarray,
-  ):
-    """Compute the log likelihood (log base 2) of a sequence of observations and actions."""
-    observations, actions = cscg_utils.prepare_obs_act(
-        observations=observations,
-        actions=actions,
-        num_devices=self._num_devices,
-        devices=self._local_devices,
-        training=False,
-    )
-
+    if emission_matrix is None:
+      emission_matrix = self._emission_matrix[0]
     emission_matrix = jnp.array(emission_matrix, dtype=self._dtype)
 
-    log2_lik, _ = self.__forward_emission(
+    log2_lik, _ = self.__forward(
         self._transition_matrix[0],
         emission_matrix,
         self._pi_states[0],
@@ -445,47 +353,21 @@ class CSCG(cscg.CSCG):
       emission_matrix: Optional[np.ndarray] = None,
   ):
     """Compute the log likelihood (log base 2) of a sequence of observations and actions."""
-
-    if emission_matrix is not None:
-      return self._bps_viterbi_emission(observations, actions, emission_matrix)
-
     observations, actions = cscg_utils.prepare_obs_act(
         observations=observations,
         actions=actions,
+        num_emissions=self._num_emissions,
         num_devices=self._num_devices,
         devices=self._local_devices,
+        dtype=self._dtype,
         training=False,
     )
 
-    log2_lik, _ = self.__forward_mp(
-        self._transition_matrix[0],
-        self._pi_states[0],
-        jnp.array(observations),
-        jnp.array(actions),
-        self._obs_to_state_start_idx[0],
-        self._masked_multiplier[0],
-        self._max_clones,
-    )
-    return -log2_lik.flatten()
-
-  def _bps_viterbi_emission(
-      self,
-      observations: np.ndarray,
-      actions: np.ndarray,
-      emission_matrix: np.ndarray,
-  ):
-    """Compute the log likelihood (log base 2) of a sequence of observations and actions."""
-    observations, actions = cscg_utils.prepare_obs_act(
-        observations=observations,
-        actions=actions,
-        num_devices=self._num_devices,
-        devices=self._local_devices,
-        training=False,
-    )
-
+    if emission_matrix is None:
+      emission_matrix = self._emission_matrix[0]
     emission_matrix = jnp.array(emission_matrix, dtype=self._dtype)
 
-    log2_lik, _ = self.__forward_emission_mp(
+    log2_lik, _ = self.__forward_mp(
         self._transition_matrix[0],
         emission_matrix,
         self._pi_states[0],
@@ -507,9 +389,17 @@ class CSCG(cscg.CSCG):
     observations, actions = cscg_utils.prepare_obs_act(
         observations=observations,
         actions=actions,
+        num_emissions=self._num_emissions,
         num_devices=self._num_devices,
         devices=self._local_devices,
+        dtype=self._dtype,
     )
+
+    if emission_matrix is not None:
+      self._emission_matrix = cscg_utils.bcast_local_devices(
+          np.array(emission_matrix, dtype=self._dtype),
+          devices=self._local_devices,
+      )
 
     convergence = []
     pbar = tqdm.trange(n_iter, position=0)
@@ -520,34 +410,19 @@ class CSCG(cscg.CSCG):
       # forward messages
       log2_lik, mess_fwd = self._forward(
           self._transition_matrix,
+          self._emission_matrix,
           self._pi_states,
           observations,
           actions,
-          self._obs_to_state_start_idx,
-          self._masked_multiplier,
-          self._max_clones,
       )
 
-      # backward messages
-      mess_bwd = self._backward(
-          self._transition_matrix,
-          observations,
-          actions,
-          self._obs_to_state_start_idx,
-          self._masked_multiplier,
-          self._max_clones,
-      )
-      mess_bwd = jnp.flip(mess_bwd, axis=1)
-
-      # # compute backward messages and update counts matrix
+      # compute backward messages and update counts matrix
       self._counts_matrix = self._update_transition_counts(
           self._transition_matrix,
+          self._emission_matrix,
           mess_fwd,
-          mess_bwd,
           observations,
           actions,
-          self._obs_to_state_start_idx,
-          self._max_clones,
       )
 
       # M step ----
@@ -577,14 +452,17 @@ class CSCG(cscg.CSCG):
       pseudocount_extra: float = 1e-20,
   ):
     """Run EM training, keeping E deterministic and fixed, learning T."""
+    # Initialize n_clones matrix if keep_clone_structure is True
     if keep_clone_structure:
       self._n_clones_matrix = self.create_n_clones_matrix()
 
     observations, actions = cscg_utils.prepare_obs_act(
         observations=observations,
         actions=actions,
+        num_emissions=self._num_emissions,
         num_devices=self._num_devices,
         devices=self._local_devices,
+        dtype=self._dtype,
     )
 
     if emission_matrix_init is None:
@@ -602,7 +480,7 @@ class CSCG(cscg.CSCG):
     else:
       emission_matrix = jnp.array(emission_matrix_init, dtype=self._dtype)
 
-    emission_matrix = cscg_utils.bcast_local_devices(
+    self._emission_matrix = cscg_utils.bcast_local_devices(
         emission_matrix, devices=self._local_devices
     )
 
@@ -613,31 +491,30 @@ class CSCG(cscg.CSCG):
     for _ in pbar:
       # E step ----
       # forward messages
-      log2_lik, mess_fwd = self._forward_emission(
+      log2_lik, mess_fwd = self._forward(
           self._transition_matrix,
-          emission_matrix,
+          self._emission_matrix,
           self._pi_states,
           observations,
           actions,
       )
 
-      mess_bwd = self._backward_emission(
-          self._transition_matrix, emission_matrix, observations, actions
+      mess_bwd = self._backward(
+          self._transition_matrix, self._emission_matrix, observations, actions
       )
       mess_bwd = jnp.flip(mess_bwd, axis=1)
 
       # Update emission counts
       emission_counts = self._update_emission_counts(
-          emission_matrix,
+          self._emission_matrix,
           mess_fwd,
           mess_bwd,
           observations,
           keep_clone_structure,
       )
-      # Get the first index as the matrix is copied across all devices
 
       # M step ----
-      emission_matrix = self._update_emission_matrix(
+      self._emission_matrix = self._update_emission_matrix(
           emission_counts, self._pseudocount, pseudocount_extra
       )
 
@@ -649,88 +526,7 @@ class CSCG(cscg.CSCG):
       if log2_lik.mean() <= log2_lik_old:
         break
       log2_lik_old = log2_lik.mean()
-    return convergence, jax.device_get(emission_matrix[0])
-
-  def learn_viterbi_emission(
-      self,
-      observations: np.ndarray,
-      actions: np.ndarray,
-      n_iter: int = 100,
-      keep_clone_structure: bool = False,
-      emission_matrix_init: Optional[np.ndarray] = None,
-      random_init: bool = False,
-      noise_seed: int = 0,
-      pseudocount_extra: float = 1e-20,
-  ):
-    """Run EM training, keeping E deterministic and fixed, learning T."""
-    if keep_clone_structure:
-      self._n_clones_matrix = self.create_n_clones_matrix()
-
-    observations, actions = cscg_utils.prepare_obs_act(
-        observations=observations,
-        actions=actions,
-        num_devices=self._num_devices,
-        devices=self._local_devices,
-    )
-
-    if emission_matrix_init is None:
-      if random_init:
-        emission_matrix = jax.random.uniform(
-            jax.random.PRNGKey(noise_seed),
-            shape=(self._num_states, self._num_emissions),
-            dtype=self._dtype,
-        )
-      else:
-        emission_matrix = jnp.ones(
-            (self._num_states, self._num_emissions), dtype=self._dtype
-        )
-      emission_matrix /= emission_matrix.sum(axis=1, keepdims=True)
-    else:
-      emission_matrix = jnp.array(emission_matrix_init, dtype=self._dtype)
-
-    emission_matrix = cscg_utils.bcast_local_devices(
-        emission_matrix, devices=self._local_devices
-    )
-
-    convergence = []
-    pbar = tqdm.trange(n_iter, position=0)
-    log2_lik_old = -np.inf
-
-    for _ in pbar:
-      # E step ----
-      # forward messages
-      log2_lik, mess_fwd = self._forward_emission(
-          self._transition_matrix,
-          emission_matrix,
-          self._pi_states,
-          observations,
-          actions,
-      )
-
-      states = self._backtrace_emission(
-          self._transition_matrix, mess_fwd, observations, actions
-      )
-
-      states = jnp.flip(states, axis=1)
-
-      # Update emission counts
-      emission_counts = self._update_emission_counts_mp(
-          emission_matrix, states, observations)
-
-      # M step ----
-      emission_matrix = self._update_emission_matrix(
-          emission_counts, self._pseudocount, pseudocount_extra
-      )
-
-      # Convergence check
-      if self._use_bfloat16:
-        log2_lik = log2_lik.astype(np.float32)
-      convergence.append(-log2_lik.mean())
-      pbar.set_postfix(train_bps=convergence[-1])
-      if log2_lik.mean() <= log2_lik_old:
-        break
-      log2_lik_old = log2_lik.mean()
-    return convergence, jax.device_get(emission_matrix[0])
+    return convergence, jax.device_get(self._emission_matrix[0])
 
   def learn_viterbi_transition(
       self,
@@ -740,13 +536,20 @@ class CSCG(cscg.CSCG):
       n_iter: int = 100,
   ):
     """Run Viterbi training, keeping E deterministic and fixed, learning T."""
-
     observations, actions = cscg_utils.prepare_obs_act(
         observations=observations,
         actions=actions,
+        num_emissions=self._num_emissions,
         num_devices=self._num_devices,
         devices=self._local_devices,
+        dtype=self._dtype,
     )
+
+    if emission_matrix is not None:
+      self._emission_matrix = cscg_utils.bcast_local_devices(
+          np.array(emission_matrix, dtype=self._dtype),
+          devices=self._local_devices,
+      )
 
     self.set_pseudocount(0.0)
 
@@ -759,31 +562,21 @@ class CSCG(cscg.CSCG):
       # forward messages
       log2_lik, mess_fwd = self._forward_mp(
           self._transition_matrix,
+          self._emission_matrix,
           self._pi_states,
           observations,
           actions,
-          self._obs_to_state_start_idx,
-          self._masked_multiplier,
-          self._max_clones,
       )
 
       # backtrace
       states = self._backtrace(
-          self._transition_matrix,
-          mess_fwd,
-          observations,
-          actions,
-          self._obs_to_state_start_idx,
-          self._masked_multiplier,
-          self._max_clones,
+          self._transition_matrix, mess_fwd, observations, actions
       )
       states = jnp.flip(states, axis=1)
 
       # update counts matrix
       self._counts_matrix = self._update_transition_counts_mp(
-          self._transition_matrix,
-          actions,
-          states,
+          self._transition_matrix, actions, states
       )
 
       # M step ----
@@ -807,61 +600,22 @@ class CSCG(cscg.CSCG):
       emission_matrix: Optional[np.ndarray] = None,
   ):
     """Compute the MAP assignment of latent variables using max-product message passing."""
-
-    if emission_matrix is not None:
-      return self._decode_emission(observations, actions, emission_matrix)
-
     observations, actions = cscg_utils.prepare_obs_act(
         observations=observations,
         actions=actions,
+        num_emissions=self._num_emissions,
         num_devices=self._num_devices,
         devices=self._local_devices,
+        dtype=self._dtype,
         training=False,
     )
 
-    # forward messages
-    log2_lik, mess_fwd = self.__forward_mp(
-        self._transition_matrix[0],
-        self._pi_states[0],
-        jnp.array(observations),
-        jnp.array(actions),
-        self._obs_to_state_start_idx[0],
-        self._masked_multiplier[0],
-        self._max_clones,
-    )
-
-    states = self.__backtrace(
-        self._transition_matrix[0],
-        mess_fwd,
-        jnp.array(observations),
-        jnp.array(actions),
-        self._obs_to_state_start_idx[0],
-        self._masked_multiplier[0],
-        self._max_clones,
-    )
-    states = jnp.flip(states, axis=0)
-
-    return -log2_lik, states.flatten()
-
-  def _decode_emission(
-      self,
-      observations: np.ndarray,
-      actions: np.ndarray,
-      emission_matrix: np.ndarray,
-  ):
-    """Compute the MAP assignment of latent variables using max-product message passing."""
-    observations, actions = cscg_utils.prepare_obs_act(
-        observations=observations,
-        actions=actions,
-        num_devices=self._num_devices,
-        devices=self._local_devices,
-        training=False,
-    )
-
+    if emission_matrix is None:
+      emission_matrix = self._emission_matrix[0]
     emission_matrix = jnp.array(emission_matrix, dtype=self._dtype)
 
     # forward messages
-    log2_lik, mess_fwd = self.__forward_emission_mp(
+    log2_lik, mess_fwd = self.__forward_mp(
         self._transition_matrix[0],
         emission_matrix,
         self._pi_states[0],
@@ -869,7 +623,7 @@ class CSCG(cscg.CSCG):
         jnp.array(actions),
     )
 
-    states = self.__backtrace_emission(
+    states = self.__backtrace(
         self._transition_matrix[0],
         mess_fwd,
         jnp.array(observations),
@@ -882,44 +636,26 @@ class CSCG(cscg.CSCG):
   def __forward(
       self,
       transition_matrices: jnp.ndarray,
+      emission_matrix: jnp.ndarray,
       pi: jnp.ndarray,
       observations: jnp.ndarray,
       actions: jnp.ndarray,
-      obs_to_start_state_index: jnp.ndarray,
-      masked_multiplier: jnp.ndarray,
-      max_clones: int,
   ):
     """Compute the forward messages."""
 
     transition_matrices = transition_matrices.transpose(0, 2, 1)
     sequence_len = observations.shape[0]
-    transition_matrices = jnp.pad(
-        transition_matrices, ((0, 0), (0, max_clones), (0, max_clones))
-    )
-
-    initial_message = jax.lax.dynamic_slice(
-        pi, (obs_to_start_state_index[observations[0]],), (max_clones,)
-    )
-
-    initial_message = jnp.multiply(
-        initial_message, masked_multiplier[observations[0]]
-    )
+    # OPTIMIZED: precompute all T emission likelihoods as one [T,E]×[E,S]
+    # GEMM instead of T sequential [E]-vector × [S,E] matvecs inside the scan.
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+    initial_message = pi * obs_liks[0]
     p_obs_0 = initial_message.sum()
     initial_message /= p_obs_0
 
     def one_step(message, n):
-      transition_slice = jax.lax.dynamic_slice(
-          transition_matrices[actions[n - 1], :, :],
-          (
-              obs_to_start_state_index[observations[n]],
-              obs_to_start_state_index[observations[n - 1]],
-          ),
-          (max_clones, max_clones),
-      )
-      new_message = jnp.matmul(transition_slice, message)
-      new_message = jnp.multiply(
-          new_message, masked_multiplier[observations[n]]
-      )
+      new_message = jnp.dot(
+          transition_matrices[actions[n - 1], :, :], message
+      ) * obs_liks[n]
       p_obs = new_message.sum()
       new_message /= p_obs
       return new_message, (new_message, p_obs)
@@ -936,116 +672,42 @@ class CSCG(cscg.CSCG):
   def __backward(
       self,
       transition_matrices: jnp.ndarray,
+      emission_matrix: jnp.ndarray,
       observations: jnp.ndarray,
       actions: jnp.ndarray,
-      obs_to_start_state_index: jnp.ndarray,
-      masked_multiplier: jnp.ndarray,
-      max_clones: int,
   ):
     """Compute the backward messages."""
 
     sequence_len = observations.shape[0]
-    transition_matrices = jnp.pad(
-        transition_matrices, ((0, 0), (0, max_clones), (0, max_clones))
-    )
 
-    initial_message = jnp.ones(max_clones, dtype=self._dtype)
-    initial_message = jnp.multiply(
-        initial_message, masked_multiplier[observations[sequence_len - 1]]
-    )
+    initial_message = jnp.ones(emission_matrix.shape[0])
     initial_message /= initial_message.sum()
 
+    # OPTIMIZED: precompute all T emission likelihoods as one [T,E]×[E,S] GEMM.
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+
     def one_step(message, n):
-      transition_slice = jax.lax.dynamic_slice(
-          transition_matrices[actions[n], :, :],
-          (
-              obs_to_start_state_index[observations[n]],
-              obs_to_start_state_index[observations[n + 1]],
-          ),
-          (max_clones, max_clones),
+      aij = actions[n - 1]
+
+      # update message
+      new_message = jnp.dot(
+          transition_matrices[aij, :, :],
+          message * obs_liks[n],
       )
-      new_message = jnp.matmul(transition_slice, message)
-      new_message = jnp.multiply(
-          new_message, masked_multiplier[observations[n]]
-      )
-      new_message /= new_message.sum()
+      p_obs = new_message.sum()
+      new_message /= p_obs
+
       return new_message, new_message
 
     _, messages = jax.lax.scan(
-        one_step, initial_message, jnp.arange(sequence_len - 2, -1, -1)
+        one_step,
+        initial_message,
+        jnp.arange(sequence_len - 1, 0, -1),
     )
-
     messages = jnp.concatenate((initial_message[None, :], messages))
-
     return messages
 
   def __update_transition_counts(
-      self,
-      transition_matrices: jnp.ndarray,
-      mess_fwd: jnp.ndarray,
-      mess_bwd: jnp.ndarray,
-      observations: jnp.ndarray,
-      actions: jnp.ndarray,
-      obs_to_start_state_index: jnp.ndarray,
-      max_clones: int,
-  ):
-    """Update the counts matrix."""
-
-    sequence_len = observations.shape[0]
-    transition_matrices = jnp.pad(
-        transition_matrices, ((0, 0), (0, max_clones), (0, max_clones))
-    )
-    counts_matrix_init = jnp.zeros(transition_matrices.shape, dtype=self._dtype)
-
-    def one_step(counts_matrix, n):
-      transition_slice = jax.lax.dynamic_slice(
-          transition_matrices[actions[n], :, :],
-          (
-              obs_to_start_state_index[observations[n]],
-              obs_to_start_state_index[observations[n + 1]],
-          ),
-          (max_clones, max_clones),
-      )
-      count_slice = jax.lax.dynamic_slice(
-          counts_matrix[actions[n], :, :],
-          (
-              obs_to_start_state_index[observations[n]],
-              obs_to_start_state_index[observations[n + 1]],
-          ),
-          (max_clones, max_clones),
-      )
-
-      q = transition_slice * (
-          mess_fwd[n, :][:, None] * mess_bwd[n + 1, :][None, :]
-      )
-      q /= q.sum()
-      update_slice = count_slice + q
-      update_slice = update_slice[None, :, :]
-
-      updated_counts_matrix = jax.lax.dynamic_update_slice(
-          counts_matrix,
-          update_slice,
-          (
-              actions[n],
-              obs_to_start_state_index[observations[n]],
-              obs_to_start_state_index[observations[n + 1]],
-          ),
-      )
-
-      return updated_counts_matrix, None
-
-    final_counts_matrix, _ = jax.lax.scan(
-        one_step,
-        counts_matrix_init,
-        jnp.arange(sequence_len - 1),
-    )
-
-    final_counts_matrix = jax.lax.psum(final_counts_matrix, axis_name="devices")
-    final_counts_matrix = final_counts_matrix[:, :-max_clones, :-max_clones]
-
-    return final_counts_matrix
-
-  def __update_transition_counts_given_emission(
       self,
       transition_matrices: jnp.ndarray,
       emission_matrix: jnp.ndarray,
@@ -1055,14 +717,16 @@ class CSCG(cscg.CSCG):
   ):
     """this function combines backward message passing with update counts."""
     sequence_len = observations.shape[0]
-
-    transition_matrices = jnp.pad(transition_matrices, ((0, 0), (0, 1), (0, 1)))
-    counts_matrix = jnp.zeros_like(transition_matrices)
-    mess_fwd = jnp.pad(mess_fwd, ((0, 0), (0, 1)))
-    emission_matrix = jnp.pad(emission_matrix, ((0, 1), (0, 0)))
+    self._counts_matrix = jnp.zeros(
+        transition_matrices.shape, dtype=self._dtype
+    )
 
     initial_message = jnp.ones(emission_matrix.shape[0], dtype=self._dtype)
     initial_message /= initial_message.sum()
+
+    # OPTIMIZED: precompute all T emission likelihoods once, eliminating two
+    # sequential dot products per scan step (one for m_b, one for new_message).
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
 
     def one_step(inputs, n):
       counts_matrix, message = inputs
@@ -1070,14 +734,14 @@ class CSCG(cscg.CSCG):
       aij = actions[n - 1]
 
       m_f = mess_fwd[n - 1]
-      m_b = message * emission_matrix[:, observations[n]]
+      m_b = message * obs_liks[n]  # weighted backward messages
 
       q = m_f.reshape(-1, 1) * transition_matrices[aij] * m_b.reshape(1, -1)
       q /= q.sum()
 
       updated_counts_matrix = counts_matrix.at[aij].add(q)
 
-      # update message
+      # update message (reuse m_b: obs_liks[n] already applied above)
       new_message = jnp.dot(transition_matrices[aij, :, :], m_b)
       p_obs = new_message.sum()
       new_message /= p_obs
@@ -1086,53 +750,75 @@ class CSCG(cscg.CSCG):
 
     (final_counts_matrix, _), _ = jax.lax.scan(
         one_step,
-        (counts_matrix, initial_message),
+        (self._counts_matrix, initial_message),
         jnp.arange(sequence_len - 1, 0, -1),
     )
 
     final_counts_matrix = jax.lax.psum(final_counts_matrix, axis_name="devices")
-    final_counts_matrix = final_counts_matrix[:, :-1, :-1]
 
     return final_counts_matrix
+
+  # ---------------------------------------------------------------------------
+  # OPTIMIZED: replaces a jax.lax.scan of T outer-product steps with a single
+  # matmul.
+  #   Original: for each t, emission_counts += outer(gamma[t], observations[t])
+  #             = sum_t( gamma[t][:,None] @ observations[t][None,:] )
+  #   Optimized: emission_counts = gamma.T @ observations
+  #             = [num_states, T] × [T, num_emissions]
+  # These are mathematically identical (sum of outer products = matrix product).
+  # The optimized form issues one BLAS kernel (tensor-core eligible on GPU)
+  # instead of T sequential tiny outer-product kernels.
+  # The win is larger here than in cscg_he because each SE scan step already
+  # does num_states × num_emissions flops (outer product), not just num_states
+  # flops (column add), so batching into a matmul has higher absolute payoff.
+  # ---------------------------------------------------------------------------
+  def __update_emission_counts(
+      self,
+      emission_matrix: jnp.ndarray,
+      mess_fwd: jnp.ndarray,
+      mess_bwd: jnp.ndarray,
+      observations: jnp.ndarray,
+      keep_clone_structure: bool = False,
+  ):
+    """Update emission counts (optimized: matmul instead of scan)."""
+    gamma = mess_fwd * mess_bwd
+    gamma /= gamma.sum(axis=1, keepdims=True)  # [T, num_states]
+
+    if keep_clone_structure:
+      gamma = jnp.dot(gamma, self._n_clones_matrix)  # pytype: disable=wrong-arg-types  # jnp-type
+
+    # gamma.T: [num_states, T],  observations: [T, num_emissions]
+    # result:  [num_states, num_emissions]
+    emission_counts = jnp.dot(gamma.T, observations)
+
+    emission_counts = jax.lax.psum(emission_counts, axis_name="devices")
+    return emission_counts
 
   def __forward_mp(
       self,
       transition_matrices: jnp.ndarray,
+      emission_matrix: jnp.ndarray,
       pi: jnp.ndarray,
       observations: jnp.ndarray,
       actions: jnp.ndarray,
-      obs_to_start_state_index: jnp.ndarray,
-      masked_multiplier: jnp.ndarray,
-      max_clones: int,
   ):
     """Compute the forward messages."""
+
     transition_matrices = transition_matrices.transpose(0, 2, 1)
     sequence_len = observations.shape[0]
-    transition_matrices = jnp.pad(
-        transition_matrices, ((0, 0), (0, max_clones), (0, max_clones))
-    )
-    initial_message = jax.lax.dynamic_slice(
-        pi, (obs_to_start_state_index[observations[0]],), (max_clones,)
-    )
-    initial_message = jnp.multiply(
-        initial_message, masked_multiplier[observations[0]]
-    )
+
+    # OPTIMIZED: precompute all T emission likelihoods as one [T,E]×[E,S] GEMM.
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+
+    initial_message = pi * obs_liks[0]
     p_obs_0 = initial_message.max()
     initial_message /= p_obs_0
 
     def one_step(message, n):
-      transition_slice = jax.lax.dynamic_slice(
-          transition_matrices[actions[n - 1], :, :],
-          (
-              obs_to_start_state_index[observations[n]],
-              obs_to_start_state_index[observations[n - 1]],
-          ),
-          (max_clones, max_clones),
-      )
-      new_message = (transition_slice * message).max(axis=1)
-      new_message = jnp.multiply(
-          new_message, masked_multiplier[observations[n]]
-      )
+      new_message = (
+          transition_matrices[actions[n - 1], :, :] * message.reshape(1, -1)
+      ).max(axis=1)
+      new_message *= obs_liks[n]
       p_obs = new_message.max()
       new_message /= p_obs
       return new_message, (new_message, p_obs)
@@ -1147,255 +833,6 @@ class CSCG(cscg.CSCG):
     return log2_lik, messages
 
   def __backtrace(
-      self,
-      transition_matrices: jnp.ndarray,
-      mess_fwd: jnp.ndarray,
-      observations: jnp.ndarray,
-      actions: jnp.ndarray,
-      obs_to_start_state_index: jnp.ndarray,
-      masked_multiplier: jnp.ndarray,
-      max_clones: int,
-  ):
-    """Compute the backtrace."""
-    sequence_len = observations.shape[0]
-    transition_matrices = jnp.pad(
-        transition_matrices, ((0, 0), (0, max_clones), (0, max_clones))
-    )
-    initial_state = (
-        mess_fwd[sequence_len - 1].argmax()
-        + obs_to_start_state_index[observations[sequence_len - 1]]
-    )
-
-    def one_step(state, n):
-      transition_slice = jax.lax.dynamic_slice(
-          transition_matrices[actions[n], :, state],
-          (obs_to_start_state_index[observations[n]],),
-          (max_clones,),
-      )
-
-      belief = mess_fwd[n] * transition_slice
-      belief = jnp.multiply(belief, masked_multiplier[observations[n]])
-      new_state = belief.argmax() + obs_to_start_state_index[observations[n]]
-      return new_state, new_state
-
-    _, states = jax.lax.scan(
-        one_step, initial_state, jnp.arange(sequence_len - 2, -1, -1)
-    )
-    states = jnp.hstack((initial_state, states))
-
-    return states
-
-  def __update_transition_counts_mp(
-      self,
-      transition_matrices: jnp.ndarray,
-      actions: jnp.ndarray,
-      states: jnp.ndarray,
-  ):
-    """Update the counts matrix."""
-
-    sequence_len = actions.shape[0]
-    counts_matrix_init = jnp.zeros(transition_matrices.shape, dtype=self._dtype)
-
-    def one_step(counts_matrix, n):
-      aij = actions[n - 1]
-      i, j = states[n - 1], states[n]
-      count_slice = jax.lax.dynamic_slice(
-          counts_matrix[aij, :, :], (i, j), (1, 1)
-      )
-      update_slice = count_slice + 1.0
-      update_slice = update_slice[None, :, :]
-      updated_counts_matrix = jax.lax.dynamic_update_slice(
-          counts_matrix,
-          update_slice,
-          (
-              aij,
-              i,
-              j,
-          ),
-      )
-      return updated_counts_matrix, None
-
-    final_counts_matrix, _ = jax.lax.scan(
-        one_step,
-        counts_matrix_init,
-        jnp.arange(1, sequence_len),
-    )
-
-    final_counts_matrix = jax.lax.psum(final_counts_matrix, axis_name="devices")
-
-    return final_counts_matrix
-
-  def __forward_emission(
-      self,
-      transition_matrices: jnp.ndarray,
-      emission_matrix: jnp.ndarray,
-      pi: jnp.ndarray,
-      observations: jnp.ndarray,
-      actions: jnp.ndarray,
-  ):
-    """Compute the forward messages with give emission matrix."""
-    transition_matrices = transition_matrices.transpose(0, 2, 1)
-    sequence_len = observations.shape[0]
-    initial_message = jnp.multiply(pi, emission_matrix[:, observations[0]])
-    p_obs_0 = initial_message.sum()
-    initial_message /= p_obs_0
-
-    def one_step(message, n):
-      new_message = jnp.matmul(transition_matrices[actions[n - 1]], message)
-      new_message = jnp.multiply(
-          new_message, emission_matrix[:, observations[n]]
-      )
-      p_obs = new_message.sum()
-      new_message /= p_obs
-      return new_message, (new_message, p_obs)
-
-    _, (messages, p_obs) = jax.lax.scan(
-        one_step, initial_message, jnp.arange(1, sequence_len)
-    )
-    messages = jnp.concatenate((initial_message[None, :], messages))
-    p_obs = jnp.hstack((p_obs_0, p_obs))
-    log2_lik = jnp.log2(p_obs)
-
-    return log2_lik, messages
-
-  def __backward_emission(
-      self,
-      transition_matrices: jnp.ndarray,
-      emission_matrix: jnp.ndarray,
-      observations: jnp.ndarray,
-      actions: jnp.ndarray,
-  ):
-    """Compute the backward messages with give emission matrix."""
-    sequence_len = observations.shape[0]
-    initial_message = jnp.ones(emission_matrix.shape[0], dtype=self._dtype)
-    initial_message /= initial_message.sum()
-
-    def one_step(message, n):
-      new_message = jnp.multiply(
-          message, emission_matrix[:, observations[n + 1]]
-      )
-      new_message = jnp.matmul(transition_matrices[actions[n]], new_message)
-      new_message /= new_message.sum()
-
-      return new_message, new_message
-
-    _, messages = jax.lax.scan(
-        one_step, initial_message, jnp.arange(sequence_len - 2, -1, -1)
-    )
-
-    messages = jnp.concatenate((initial_message[None, :], messages))
-
-    return messages
-
-  def __update_emission_counts(
-      self,
-      emission_matrix: jnp.ndarray,
-      mess_fwd: jnp.ndarray,
-      mess_bwd: jnp.ndarray,
-      observations: jnp.ndarray,
-      keep_clone_structure: bool = False,
-  ):
-    """Update emission counts."""
-    sequence_len = observations.shape[0]
-
-    gamma = mess_fwd * mess_bwd
-    gamma /= gamma.sum(axis=1, keepdims=True)  # sum over latent states
-
-    if keep_clone_structure:
-      gamma = jnp.dot(gamma, self.n_clones_matrix)
-
-    emission_counts_init = jnp.zeros(emission_matrix.shape)
-
-    def one_step(counts_matrix, n):
-      update_slice = counts_matrix[:, observations[n]] + gamma[n]
-
-      updated_counts_matrix = jax.lax.dynamic_update_slice(
-          counts_matrix,
-          update_slice[:, None],
-          (counts_matrix.shape[0], observations[n]),
-      )
-
-      return updated_counts_matrix, None
-
-    emission_counts, _ = jax.lax.scan(
-        one_step, emission_counts_init, jnp.arange(sequence_len)
-    )
-
-    emission_counts = jax.lax.psum(emission_counts, axis_name="devices")
-
-    return emission_counts
-
-  def __update_emission_counts_mp(
-      self,
-      emission_matrix: jnp.ndarray,
-      states: jnp.ndarray,
-      observations: jnp.ndarray,
-  ):
-    """Update the emission counts matrix."""
-    sequence_len = observations.shape[0]
-    emission_counts_init = jnp.zeros(emission_matrix.shape)
-
-    def one_step(counts_matrix, n):
-      i, j = states[n], observations[n]
-      count_slice = jax.lax.dynamic_slice(
-          counts_matrix, (i, j), (1, 1)
-      )
-      update_slice = count_slice + 1.0
-      # update_slice = update_slice[None, :, :]
-      updated_counts_matrix = jax.lax.dynamic_update_slice(
-          counts_matrix,
-          update_slice,
-          (
-              i,
-              j,
-          ),
-      )
-      return updated_counts_matrix, None
-
-    final_counts_matrix, _ = jax.lax.scan(
-        one_step,
-        emission_counts_init,
-        jnp.arange(1, sequence_len),
-    )
-
-    final_counts_matrix = jax.lax.psum(final_counts_matrix, axis_name="devices")
-
-    return final_counts_matrix
-
-  def __forward_emission_mp(
-      self,
-      transition_matrices: jnp.ndarray,
-      emission_matrix: jnp.ndarray,
-      pi: jnp.ndarray,
-      observations: jnp.ndarray,
-      actions: jnp.ndarray,
-  ):
-    """Compute the forward messages with give emission matrix."""
-    transition_matrices = transition_matrices.transpose(0, 2, 1)
-    sequence_len = observations.shape[0]
-    initial_message = jnp.multiply(pi, emission_matrix[:, observations[0]])
-    p_obs_0 = initial_message.sum()
-    initial_message /= p_obs_0
-
-    def one_step(message, n):
-      new_message = (transition_matrices[actions[n - 1]] * message).max(axis=1)
-      new_message = jnp.multiply(
-          new_message, emission_matrix[:, observations[n]]
-      )
-      p_obs = new_message.max()
-      new_message /= p_obs
-      return new_message, (new_message, p_obs)
-
-    _, (messages, p_obs) = jax.lax.scan(
-        one_step, initial_message, jnp.arange(1, sequence_len)
-    )
-    messages = jnp.concatenate((initial_message[None, :], messages))
-    p_obs = jnp.hstack((p_obs_0, p_obs))
-    log2_lik = jnp.log2(p_obs)
-
-    return log2_lik, messages
-
-  def __backtrace_emission(
       self,
       transition_matrices: jnp.ndarray,
       mess_fwd: jnp.ndarray,
@@ -1419,6 +856,30 @@ class CSCG(cscg.CSCG):
 
     return states
 
+  # ---------------------------------------------------------------------------
+  # OPTIMIZED: replaces jax.lax.scan of T sequential at[a,i,j].add(1) steps
+  # with a single vectorized scatter-add over all T timesteps at once.
+  # All (action, from_state, to_state) triplets are known upfront.
+  # ---------------------------------------------------------------------------
+  def __update_transition_counts_mp(
+      self,
+      transition_matrices: jnp.ndarray,
+      actions: jnp.ndarray,
+      states: jnp.ndarray,
+  ):
+    """This function updates counts matrix (optimized: scatter instead of scan)."""
+    final_counts_matrix = jnp.zeros(
+        transition_matrices.shape, dtype=self._dtype
+    )
+    # actions[:-1]  : action at step t       (shape [T-1])
+    # states[:-1]   : from-state at step t   (shape [T-1])
+    # states[1:]    : to-state   at step t+1 (shape [T-1])
+    final_counts_matrix = final_counts_matrix.at[
+        actions[:-1], states[:-1], states[1:]
+    ].add(1.0)
+    final_counts_matrix = jax.lax.psum(final_counts_matrix, axis_name="devices")
+    return final_counts_matrix
+
   def __forward_mp_all(
       self,
       transition_matrices: jnp.ndarray,
@@ -1426,7 +887,6 @@ class CSCG(cscg.CSCG):
       pi_actions: jnp.ndarray,
       target_state: int,
       max_steps: int,
-      min_prob: float = 0.0,
   ):
     """Compute the forward messages."""
     transition_matrices = transition_matrices.transpose(0, 2, 1)
@@ -1449,7 +909,7 @@ class CSCG(cscg.CSCG):
       message /= p_obs
       log2_lik.append(np.log2(p_obs))
       mess_fwd.append(message)
-      if message[target_state] > min_prob:
+      if message[target_state] > 0:
         break
     else:
       assert False, "Unable to find a bridging path"

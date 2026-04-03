@@ -51,7 +51,7 @@ from cscg import cscg_se_opt
 N_EMISSIONS    = 20
 CLONES_PER_OBS = 10
 N_ACTIONS      = 4
-SEQ_LEN        = 80_000
+SEQ_LEN        = 10_000
 BENCH_ITERS    = 6
 SEED           = 0
 
