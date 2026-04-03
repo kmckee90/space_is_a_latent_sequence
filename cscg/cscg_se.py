@@ -645,14 +645,17 @@ class CSCG(cscg.CSCG):
 
     transition_matrices = transition_matrices.transpose(0, 2, 1)
     sequence_len = observations.shape[0]
-    initial_message = pi * jnp.dot(emission_matrix, observations[0])
+    # OPTIMIZED: precompute all T emission likelihoods as one [T,E]×[E,S]
+    # GEMM instead of T sequential [E]-vector × [S,E] matvecs inside the scan.
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+    initial_message = pi * obs_liks[0]
     p_obs_0 = initial_message.sum()
     initial_message /= p_obs_0
 
     def one_step(message, n):
       new_message = jnp.dot(
           transition_matrices[actions[n - 1], :, :], message
-      ) * jnp.dot(emission_matrix, observations[n])
+      ) * obs_liks[n]
       p_obs = new_message.sum()
       new_message /= p_obs
       return new_message, (new_message, p_obs)
@@ -680,13 +683,16 @@ class CSCG(cscg.CSCG):
     initial_message = jnp.ones(emission_matrix.shape[0])
     initial_message /= initial_message.sum()
 
+    # OPTIMIZED: precompute all T emission likelihoods as one [T,E]×[E,S] GEMM.
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+
     def one_step(message, n):
       aij = actions[n - 1]
 
       # update message
       new_message = jnp.dot(
           transition_matrices[aij, :, :],
-          message * jnp.dot(emission_matrix, observations[n]),
+          message * obs_liks[n],
       )
       p_obs = new_message.sum()
       new_message /= p_obs
@@ -718,26 +724,25 @@ class CSCG(cscg.CSCG):
     initial_message = jnp.ones(emission_matrix.shape[0], dtype=self._dtype)
     initial_message /= initial_message.sum()
 
+    # OPTIMIZED: precompute all T emission likelihoods once, eliminating two
+    # sequential dot products per scan step (one for m_b, one for new_message).
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+
     def one_step(inputs, n):
       counts_matrix, message = inputs
 
       aij = actions[n - 1]
 
       m_f = mess_fwd[n - 1]
-      m_b = message * jnp.dot(
-          emission_matrix, observations[n]
-      )  # weighted backward messages
+      m_b = message * obs_liks[n]  # weighted backward messages
 
       q = m_f.reshape(-1, 1) * transition_matrices[aij] * m_b.reshape(1, -1)
       q /= q.sum()
 
       updated_counts_matrix = counts_matrix.at[aij].add(q)
 
-      # update message
-      new_message = jnp.dot(
-          transition_matrices[aij, :, :],
-          message * jnp.dot(emission_matrix, observations[n]),
-      )
+      # update message (reuse m_b: obs_liks[n] already applied above)
+      new_message = jnp.dot(transition_matrices[aij, :, :], m_b)
       p_obs = new_message.sum()
       new_message /= p_obs
 
@@ -753,6 +758,20 @@ class CSCG(cscg.CSCG):
 
     return final_counts_matrix
 
+  # ---------------------------------------------------------------------------
+  # OPTIMIZED: replaces a jax.lax.scan of T outer-product steps with a single
+  # matmul.
+  #   Original: for each t, emission_counts += outer(gamma[t], observations[t])
+  #             = sum_t( gamma[t][:,None] @ observations[t][None,:] )
+  #   Optimized: emission_counts = gamma.T @ observations
+  #             = [num_states, T] × [T, num_emissions]
+  # These are mathematically identical (sum of outer products = matrix product).
+  # The optimized form issues one BLAS kernel (tensor-core eligible on GPU)
+  # instead of T sequential tiny outer-product kernels.
+  # The win is larger here than in cscg_he because each SE scan step already
+  # does num_states × num_emissions flops (outer product), not just num_states
+  # flops (column add), so batching into a matmul has higher absolute payoff.
+  # ---------------------------------------------------------------------------
   def __update_emission_counts(
       self,
       emission_matrix: jnp.ndarray,
@@ -761,27 +780,18 @@ class CSCG(cscg.CSCG):
       observations: jnp.ndarray,
       keep_clone_structure: bool = False,
   ):
-    """Update emission counts."""
-    sequence_len = observations.shape[0]
-
+    """Update emission counts (optimized: matmul instead of scan)."""
     gamma = mess_fwd * mess_bwd
-    gamma /= gamma.sum(axis=1, keepdims=True)  # sum over latent states axis
+    gamma /= gamma.sum(axis=1, keepdims=True)  # [T, num_states]
 
     if keep_clone_structure:
       gamma = jnp.dot(gamma, self._n_clones_matrix)  # pytype: disable=wrong-arg-types  # jnp-type
 
-    emission_counts_init = emission_matrix * 0
-
-    def one_step(counts_matrix, n):
-      counts_matrix += jnp.dot(gamma[n][:, None], observations[n][None, :])
-      return counts_matrix, None
-
-    emission_counts, _ = jax.lax.scan(
-        one_step, emission_counts_init, jnp.arange(sequence_len)
-    )
+    # gamma.T: [num_states, T],  observations: [T, num_emissions]
+    # result:  [num_states, num_emissions]
+    emission_counts = jnp.dot(gamma.T, observations)
 
     emission_counts = jax.lax.psum(emission_counts, axis_name="devices")
-
     return emission_counts
 
   def __forward_mp(
@@ -797,7 +807,10 @@ class CSCG(cscg.CSCG):
     transition_matrices = transition_matrices.transpose(0, 2, 1)
     sequence_len = observations.shape[0]
 
-    initial_message = pi * jnp.dot(emission_matrix, observations[0])
+    # OPTIMIZED: precompute all T emission likelihoods as one [T,E]×[E,S] GEMM.
+    obs_liks = jnp.dot(observations, emission_matrix.T)  # [T, S]
+
+    initial_message = pi * obs_liks[0]
     p_obs_0 = initial_message.max()
     initial_message /= p_obs_0
 
@@ -805,7 +818,7 @@ class CSCG(cscg.CSCG):
       new_message = (
           transition_matrices[actions[n - 1], :, :] * message.reshape(1, -1)
       ).max(axis=1)
-      new_message *= jnp.dot(emission_matrix, observations[n])
+      new_message *= obs_liks[n]
       p_obs = new_message.max()
       new_message /= p_obs
       return new_message, (new_message, p_obs)
@@ -843,31 +856,28 @@ class CSCG(cscg.CSCG):
 
     return states
 
+  # ---------------------------------------------------------------------------
+  # OPTIMIZED: replaces jax.lax.scan of T sequential at[a,i,j].add(1) steps
+  # with a single vectorized scatter-add over all T timesteps at once.
+  # All (action, from_state, to_state) triplets are known upfront.
+  # ---------------------------------------------------------------------------
   def __update_transition_counts_mp(
       self,
       transition_matrices: jnp.ndarray,
       actions: jnp.ndarray,
       states: jnp.ndarray,
   ):
-    """This function updates counts matrix."""
-    sequence_len = actions.shape[0]
-    self._counts_matrix = jnp.zeros(
+    """This function updates counts matrix (optimized: scatter instead of scan)."""
+    final_counts_matrix = jnp.zeros(
         transition_matrices.shape, dtype=self._dtype
     )
-
-    def one_step(counts_matrix, n):
-      aij = actions[n - 1]
-      i, j = states[n - 1], states[n]
-      updated_counts_matrix = counts_matrix.at[aij, i, j].add(1.0)
-
-      return updated_counts_matrix, None
-
-    final_counts_matrix, _ = jax.lax.scan(
-        one_step, self._counts_matrix, jnp.arange(1, sequence_len)
-    )
-
+    # actions[:-1]  : action at step t       (shape [T-1])
+    # states[:-1]   : from-state at step t   (shape [T-1])
+    # states[1:]    : to-state   at step t+1 (shape [T-1])
+    final_counts_matrix = final_counts_matrix.at[
+        actions[:-1], states[:-1], states[1:]
+    ].add(1.0)
     final_counts_matrix = jax.lax.psum(final_counts_matrix, axis_name="devices")
-
     return final_counts_matrix
 
   def __forward_mp_all(
