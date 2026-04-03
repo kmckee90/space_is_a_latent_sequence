@@ -64,3 +64,19 @@
 | `learn_viterbi_transition` | scatter + obs_liks precompute | 7536.3 | 7483.0 | 1.01× | 26.6 | 21.2 | **1.25×** |
 | `learn_em_transition` | obs_liks precompute in scan | 63278.9 | 77541.0 | 0.82× | 80.6 | 82.0 | 0.98× |
 | `learn_em_emission` | matmul + obs_liks precompute | 28739.7 | 25187.2 | **1.14×** | 277.1 | 273.6 | 1.01× |
+
+---
+
+## Optimizations
+
+**Transition scatter (HE + SE `learn_viterbi_transition`)**
+`__update_transition_counts_mp`: replaced a `jax.lax.scan` that incremented `counts[a, i, j]` one timestep at a time with a single `.at[actions[:-1], states[:-1], states[1:]].add(1)`. Valid because Viterbi states are fully decoded before counting, so there is no sequential dependency.
+
+**obs_liks precompute (HE `learn_em_emission`, `learn_viterbi_emission`; SE all methods)**
+`__forward_emission`, `__backward_emission`, `__forward_emission_mp` (HE); `__forward`, `__backward`, `__forward_mp`, `__update_transition_counts` (SE): replaced T sequential column-gathers `emission_matrix[:, obs[t]]` (HE) or matvecs `emission_matrix @ obs[t]` (SE) with a single batched op computed once before the scan — `emission_matrix[:, observations].T` (HE) or `observations @ emission_matrix.T` (SE).
+
+**Emission scatter (HE `learn_em_emission`, `learn_viterbi_emission`)**
+`__update_emission_counts` and `__update_emission_counts_mp`: replaced scans over T column-add or scalar-update steps with scatter-adds — `emission_counts.at[:, obs].add(gamma.T)` and `counts.at[states, obs].add(1)` respectively.
+
+**Emission matmul (SE `learn_em_emission`)**
+`__update_emission_counts`: replaced a scan of T outer-product accumulations with a single `gamma.T @ observations` matmul. Clean replacement because soft observations are already a float `[T, E]` matrix.
