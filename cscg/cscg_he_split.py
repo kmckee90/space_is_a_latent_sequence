@@ -1974,6 +1974,7 @@ class CSCG(cscg.CSCG):
       emission_vec: Optional[np.ndarray] = None,
       p_surprise: float = 0.1,
       n_iters: int = 1,
+      method: str = 'argmax',
   ) -> np.ndarray:
     """Fast rebinding — Algorithm 1 from Swaminathan et al. 2023.
 
@@ -1988,12 +1989,15 @@ class CSCG(cscg.CSCG):
     emission_vec : (H,) initial emission assignment.  None = identity (slot j → j).
     p_surprise   : confidence threshold θ for anchor / candidate detection
     n_iters      : number of outer EM iterations
+    method       : assignment method — 'hungarian' (default, injective) or
+                   'argmax' (ML per-slot argmax, allows token collisions)
 
     Returns
     -------
     emission_vec : (H,) rebound emission vector
     """
-    from scipy.optimize import linear_sum_assignment
+    if method == 'hungarian':
+      from scipy.optimize import linear_sum_assignment
 
     K = self._num_emissions
     T = len(observations)
@@ -2033,7 +2037,7 @@ class CSCG(cscg.CSCG):
       loo_active *= (~correct).astype(np.float32)           # exclude already-correct pairs
       affinity = loo_active.T @ obs_onehot                  # (K, K_full)
 
-      # Run linear assignment on non-anchor slots only
+      # Assignment on non-anchor slots only
       candidate_slots = np.where(~is_anchor_slot)[0]
       if len(candidate_slots) == 0:
         break
@@ -2041,7 +2045,12 @@ class CSCG(cscg.CSCG):
       if affinity_sub.max() == 0:
         break
 
-      row_ind, col_ind = linear_sum_assignment(-affinity_sub)
+      if method == 'hungarian':
+        row_ind, col_ind = linear_sum_assignment(-affinity_sub)
+      else:  # argmax — each slot independently picks its highest-affinity token
+        col_ind = affinity_sub.argmax(axis=1)
+        row_ind = np.arange(len(candidate_slots))
+
       for i, ci in zip(row_ind, col_ind):
         if affinity_sub[i, ci] > 0:
           j = int(candidate_slots[i])
