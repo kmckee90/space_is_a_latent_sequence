@@ -85,3 +85,86 @@ num_splits ∈ {8, 16, 32, 64}.
 ### Speed comparison
 
 ![Speed comparison](split_ablation_results/split_em_2/speed_comparison.png)
+
+
+---
+
+## split_em_2: parallelised counts accumulation (HE and SE)
+
+**Summary of changes vs split_em:**
+- `_update_transition_counts` replaced with a segment-parallel version (same
+  `num_splits` as the EM forward/backward split).  Each segment runs an
+  independent local scan of length `T/num_splits - 1`; local counts are summed.
+- `_update_emission_counts` replaced with `gamma.T @ observations` (SE) or a
+  direct scatter-add `emission_counts.at[:, obs].add(gamma.T)` (HE) — no scan.
+- `_update_transition_counts_mp` (Viterbi) replaced with
+  `counts.at[a[:-1], s[:-1], s[1:]].add(1.0)` — one-line scatter-add.
+- `_update_emission_counts_mp` (HE Viterbi) similarly replaced.
+
+**Setup:** Same 6×6 grid world, T=99,968 steps, seed=42.
+Same initial counts matrix across all models within each type.
+EM: up to 20 iters (early stop). Viterbi: 5 iters.
+Timing: steady-state (after 1 JIT-warmup iter), averaged over 15 iters.
+num_splits ∈ {32, 64}.
+
+---
+
+### HE results
+
+#### Recovered graphs
+
+![HE graphs](split_ablation_results/split_em_2/he_graphs.png)
+
+#### Convergence
+
+![HE convergence](split_ablation_results/split_em_2/he_convergence.png)
+
+#### Summary table
+
+| Model | Decoded states | EM iters | EM final bps | Vit iters | Vit final bps | sec/EM iter | Speedup vs no-split |
+|---|---|---|---|---|---|---|---|
+| no split | 99 | 20 | 0.2950 | 5 | 0.2986 | 3.686s | 1.00× |
+| split_em_2 ns=32 | 100 | 20 | 0.2959 | 5 | 0.3059 | 0.088s | 41.91× |
+| split_em_2 ns=64 | 97 | 20 | 0.2967 | 5 | 0.3002 | 0.045s | 81.09× |
+
+#### Timing
+
+| Model | sec/EM iter | Speedup |
+|---|---|---|
+| no split | 3.686s | 1.00× |
+| split_em_2 ns=32 | 0.088s | 41.91× |
+| split_em_2 ns=64 | 0.045s | 81.09× |
+
+---
+
+### SE results
+
+#### Recovered graphs
+
+![SE graphs](split_ablation_results/split_em_2/se_graphs.png)
+
+#### Convergence
+
+![SE convergence](split_ablation_results/split_em_2/se_convergence.png)
+
+#### Summary table
+
+| Model | Decoded states | EM iters | EM final bps | Vit iters | Vit final bps | sec/EM iter | Speedup vs no-split |
+|---|---|---|---|---|---|---|---|
+| no split | 99 | 20 | 0.2950 | 5 | 0.2986 | 2.577s | 1.00× |
+| split_em_2 ns=32 | 100 | 20 | 0.2959 | 5 | 0.3065 | 0.091s | 28.43× |
+| split_em_2 ns=64 | 99 | 20 | 0.2967 | 5 | 0.2994 | 0.047s | 54.57× |
+
+#### Timing
+
+| Model | sec/EM iter | Speedup |
+|---|---|---|
+| no split | 2.577s | 1.00× |
+| split_em_2 ns=32 | 0.091s | 28.43× |
+| split_em_2 ns=64 | 0.047s | 54.57× |
+
+---
+
+### Speed comparison
+
+![Speed comparison](split_ablation_results/split_em_2/speed_comparison.png)

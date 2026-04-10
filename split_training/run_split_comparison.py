@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare no-split baseline vs split_em_2 for HE and SE models.
+"""Compare no-split baseline vs split_em for HE and SE models.
 
 Tests num_splits in [8, 16, 32, 64].  Appends a new section to
 split_ablation_report.md with timing tables, graph figures, and convergence
@@ -20,8 +20,8 @@ import matplotlib.patches as mpatches
 
 sys.path.insert(0, '/data/users/kevin/space_is_a_latent_sequence')
 
-from cscg import cscg_se, cscg_se_split_em_2
-from cscg import cscg_he, cscg_he_split_em_2
+from cscg import cscg_se, cscg_se_split
+from cscg import cscg_he, cscg_he_split
 from cscg import utils
 
 plt.rcParams.update({'font.size': 12})
@@ -30,16 +30,16 @@ plt.rcParams.update({'font.size': 12})
 # Config
 # ---------------------------------------------------------------------------
 N = 6
-LENGTH = 120000
-SPLIT_VALUES = [8, 16, 32, 64]
+LENGTH = 100000
+SPLIT_VALUES = [32, 64]
 N_TIMING_ITER = 15
-N_EM_ITER = 150
-N_VIT_ITER = 10
+N_EM_ITER = 20
+N_VIT_ITER = 5
 PSEUDOCOUNT = 5e-4
 SEED = 0
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'split_ablation_results')
-FIG_DIR = os.path.join(RESULTS_DIR, 'split_em_2')
+FIG_DIR = os.path.join(RESULTS_DIR, 'split_em')
 os.makedirs(FIG_DIR, exist_ok=True)
 REPORT_PATH = os.path.join(os.path.dirname(__file__), 'split_ablation_report.md')
 
@@ -194,11 +194,11 @@ he_results = {'no-split': run_he_model('HE no-split', he_base_model, he_init)}
 he_base_sec = he_results['no-split']['em_sec']
 
 for ns in SPLIT_VALUES:
-    m = cscg_he_split_em_2.CSCG(n_clones=n_clones, pseudocount=PSEUDOCOUNT,
+    m = cscg_he_split.CSCG(n_clones=n_clones, pseudocount=PSEUDOCOUNT,
                                   n_actions=4, seed=SEED, batched=True,
                                   num_splits=ns)
     assert np.allclose(m.counts_matrix, he_init), "counts mismatch"
-    he_results[ns] = run_he_model(f'HE split_em_2 ns={ns}', m, he_init)
+    he_results[ns] = run_he_model(f'HE split_em ns={ns}', m, he_init)
 
 # HE graphs figure
 n_cols = 1 + len(SPLIT_VALUES)
@@ -209,11 +209,11 @@ for col, key in enumerate(['no-split'] + SPLIT_VALUES):
         title = f'HE no-split\n{res["em_sec"]:.3f}s/iter | {res["n_unique"]} states'
     else:
         speedup = he_base_sec / res['em_sec']
-        title = (f'HE split_em_2 ns={key}\n'
+        title = (f'HE split_em ns={key}\n'
                  f'{res["em_sec"]:.3f}s/iter ({speedup:.1f}×) | {res["n_unique"]} states')
     plot_graph_ax(axes[col], res['model'], res['states'], res['pos_graph'], title)
 axes[-1].legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-fig.suptitle('HE: no-split vs split_em_2 — recovered graphs', fontsize=13)
+fig.suptitle('HE: no-split vs split_em — recovered graphs', fontsize=13)
 plt.tight_layout()
 he_graphs_path = os.path.join(FIG_DIR, 'he_graphs.png')
 fig.savefig(he_graphs_path, dpi=120, bbox_inches='tight')
@@ -223,13 +223,13 @@ print(f'Saved {he_graphs_path}')
 # HE convergence figure
 fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 for key, res in he_results.items():
-    lbl = 'no-split' if key == 'no-split' else f'split_em_2 ns={key}'
+    lbl = 'no-split' if key == 'no-split' else f'split_em ns={key}'
     axes[0].plot(res['conv_em'], label=lbl)
     axes[1].plot(res['conv_vit'], label=lbl)
 axes[0].set_title('HE EM convergence'); axes[0].set_xlabel('iteration'); axes[0].set_ylabel('bps')
 axes[1].set_title('HE Viterbi convergence'); axes[1].set_xlabel('iteration')
 for ax in axes: ax.legend(fontsize=9)
-fig.suptitle('HE convergence: no-split vs split_em_2', fontsize=13)
+fig.suptitle('HE convergence: no-split vs split_em', fontsize=13)
 plt.tight_layout()
 he_conv_path = os.path.join(FIG_DIR, 'he_convergence.png')
 fig.savefig(he_conv_path, dpi=120, bbox_inches='tight')
@@ -250,11 +250,11 @@ se_results = {'no-split': run_se_model('SE no-split', se_base_model, se_init)}
 se_base_sec = se_results['no-split']['em_sec']
 
 for ns in SPLIT_VALUES:
-    m = cscg_se_split_em_2.CSCG(n_clones=n_clones, pseudocount=PSEUDOCOUNT,
+    m = cscg_se_split.CSCG(n_clones=n_clones, pseudocount=PSEUDOCOUNT,
                                   n_actions=4, seed=SEED, batched=True,
                                   num_splits=ns)
     assert np.allclose(m.counts_matrix, se_init), "counts mismatch"
-    se_results[ns] = run_se_model(f'SE split_em_2 ns={ns}', m, se_init)
+    se_results[ns] = run_se_model(f'SE split_em ns={ns}', m, se_init)
 
 # SE graphs figure
 fig, axes = plt.subplots(1, n_cols, figsize=(4*n_cols, 4.5))
@@ -264,11 +264,11 @@ for col, key in enumerate(['no-split'] + SPLIT_VALUES):
         title = f'SE no-split\n{res["em_sec"]:.3f}s/iter | {res["n_unique"]} states'
     else:
         speedup = se_base_sec / res['em_sec']
-        title = (f'SE split_em_2 ns={key}\n'
+        title = (f'SE split_em ns={key}\n'
                  f'{res["em_sec"]:.3f}s/iter ({speedup:.1f}×) | {res["n_unique"]} states')
     plot_graph_ax(axes[col], res['model'], res['states'], res['pos_graph'], title)
 axes[-1].legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-fig.suptitle('SE: no-split vs split_em_2 — recovered graphs', fontsize=13)
+fig.suptitle('SE: no-split vs split_em — recovered graphs', fontsize=13)
 plt.tight_layout()
 se_graphs_path = os.path.join(FIG_DIR, 'se_graphs.png')
 fig.savefig(se_graphs_path, dpi=120, bbox_inches='tight')
@@ -278,13 +278,13 @@ print(f'Saved {se_graphs_path}')
 # SE convergence figure
 fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 for key, res in se_results.items():
-    lbl = 'no-split' if key == 'no-split' else f'split_em_2 ns={key}'
+    lbl = 'no-split' if key == 'no-split' else f'split_em ns={key}'
     axes[0].plot(res['conv_em'], label=lbl)
     axes[1].plot(res['conv_vit'], label=lbl)
 axes[0].set_title('SE EM convergence'); axes[0].set_xlabel('iteration'); axes[0].set_ylabel('bps')
 axes[1].set_title('SE Viterbi convergence'); axes[1].set_xlabel('iteration')
 for ax in axes: ax.legend(fontsize=9)
-fig.suptitle('SE convergence: no-split vs split_em_2', fontsize=13)
+fig.suptitle('SE convergence: no-split vs split_em', fontsize=13)
 plt.tight_layout()
 se_conv_path = os.path.join(FIG_DIR, 'se_convergence.png')
 fig.savefig(se_conv_path, dpi=120, bbox_inches='tight')
@@ -307,11 +307,11 @@ for ax, (model_type, results, base_sec) in zip(
     ax.set_xticklabels([str(k) for k in xs], fontsize=10)
     ax.set_xlabel('num_splits')
     ax.set_ylabel('Speedup vs no-split')
-    ax.set_title(f'{model_type}: split_em_2 speedup')
+    ax.set_title(f'{model_type}: split_em speedup')
     for bar, sp, sec in zip(bars, speedups, secs):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.05,
                 f'{sp:.1f}×\n({sec:.3f}s)', ha='center', va='bottom', fontsize=9)
-fig.suptitle('split_em_2 speedup over no-split baseline', fontsize=13)
+fig.suptitle('split_em speedup over no-split baseline', fontsize=13)
 plt.tight_layout()
 speed_path = os.path.join(FIG_DIR, 'speed_comparison.png')
 fig.savefig(speed_path, dpi=120, bbox_inches='tight')
@@ -326,7 +326,7 @@ def make_table(results, base_sec):
     for key in ['no-split'] + SPLIT_VALUES:
         r = results[key]
         speedup = base_sec / r['em_sec']
-        label = 'no split' if key == 'no-split' else f'split_em_2 ns={key}'
+        label = 'no split' if key == 'no-split' else f'split_em ns={key}'
         rows.append(
             f'| {label} | {r["n_unique"]} | {len(r["conv_em"])} | '
             f'{r["conv_em"][-1]:.4f} | {len(r["conv_vit"])} | '
@@ -344,19 +344,19 @@ def make_speed_table(results, base_sec):
     for key in ['no-split'] + SPLIT_VALUES:
         r = results[key]
         speedup = base_sec / r['em_sec']
-        label = 'no split' if key == 'no-split' else f'split_em_2 ns={key}'
+        label = 'no split' if key == 'no-split' else f'split_em ns={key}'
         rows.append(f'| {label} | {r["em_sec"]:.3f}s | {speedup:.2f}× |')
     header = '| Model | sec/EM iter | Speedup |\n|---|---|---|'
     return header + '\n' + '\n'.join(rows)
 
 # Relative paths for the report (report is in experiment_notebooks/)
-rel = 'split_ablation_results/split_em_2'
+rel = 'split_ablation_results/split_em'
 
 section = textwrap.dedent(f"""
 
 ---
 
-## split_em_2: parallelised counts accumulation (HE and SE)
+## split_em: parallelised counts accumulation (HE and SE)
 
 **Summary of changes vs split_em:**
 - `_update_transition_counts` replaced with a segment-parallel version (same
