@@ -1989,8 +1989,8 @@ class CSCG(cscg.CSCG):
     emission_vec : (H,) initial emission assignment.  None = identity (slot j → j).
     p_surprise   : confidence threshold θ for anchor / candidate detection
     n_iters      : number of outer EM iterations
-    method       : assignment method — 'hungarian' (default, injective) or
-                   'argmax' (ML per-slot argmax, allows token collisions)
+    method       : assignment method — 'argmax' (default, ML per-slot argmax, allows token collisions) or 'hungarian' (injective, \O(T^3))
+                   
 
     Returns
     -------
