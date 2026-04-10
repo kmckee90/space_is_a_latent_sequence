@@ -275,6 +275,13 @@ class CSCG(cscg.CSCG):
         self._counts_matrix, self._pseudocount
     )
 
+    # Precompute (H, K) membership matrix: membership[h, k] = 1 iff state h
+    # belongs to clone group k.  Used by leave_one_out_slot_probs.
+    _state_to_slot = np.repeat(np.arange(self._num_emissions), self._n_clones)
+    self._membership_matrix = jax.nn.one_hot(
+        _state_to_slot, self._num_emissions, dtype=jnp.float32
+    )  # (H, K)
+
   @property
   def implementation(self) -> str:
     return f"he_split_{self._num_splits}"               # CHANGED
@@ -318,6 +325,11 @@ class CSCG(cscg.CSCG):
     if self._n_clones_matrix is None:
       raise ValueError
     return self._n_clones_matrix
+
+  @property
+  def default_emission_vec(self) -> np.ndarray:
+    """Identity emission vector: state h emits the token of its clone group."""
+    return np.repeat(np.arange(self._num_emissions, dtype=np.int32), self._n_clones)
 
   def set_counts_matrix(self, counts_matrix: np.ndarray):
     """Set the counts matrix."""
@@ -1779,3 +1791,260 @@ class CSCG(cscg.CSCG):
   # for easy diff comparison.  The training loop no longer calls these
   # directly; it calls the split/scatter variants above via self._forward etc.
   # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Rebinding (Algorithm 1 from Swaminathan et al. 2023)
+  #
+  # Public entry points (all optional — do not affect training):
+  #   default_emission_vec         property: (H,) identity slot→token assignment
+  #   forward_backward_rebound     forward-backward under a rebound emission
+  #   leave_one_out_slot_probs     (T, K) LOO posterior over slots
+  #   rebind                       full Algorithm 1 — returns rebound emission_vec
+  #
+  # Internal helpers:
+  #   _emission_vec_to_matrix      (H,) int vec → (H, K) one-hot emission matrix
+  #   __forward_emission_with_pred_alpha
+  #                                forward scan that also returns pred_alpha
+  # ---------------------------------------------------------------------------
+
+  def _emission_vec_to_matrix(
+      self,
+      emission_vec: np.ndarray,
+      n_tokens: Optional[int] = None,
+  ) -> jnp.ndarray:
+    """Convert an (H,) integer emission vector to an (H, n_tokens) one-hot matrix.
+
+    Parameters
+    ----------
+    emission_vec : (H,) integer array — emission_vec[h] = token emitted by state h.
+                   May reference token ids beyond self._num_emissions (novel tokens).
+    n_tokens     : size of the token dimension.  Defaults to self._num_emissions.
+                   Pass max(obs.max()+1, self._num_emissions) when the probe
+                   sequence contains tokens outside the training vocabulary.
+
+    If no state emits token k (novel token), its column is set to all-ones so
+    the forward-backward treats it as a uniformly uninformative observation.
+    """
+    K = int(n_tokens) if n_tokens is not None else self._num_emissions
+    mat = jax.nn.one_hot(
+        jnp.array(emission_vec, dtype=jnp.int32),
+        K,
+        dtype=self._dtype,
+    )  # (H, K)
+    # Novel-token fallback: replace all-zero columns with all-ones
+    col_sums = mat.sum(axis=0, keepdims=True)  # (1, K)
+    mat = jnp.where(col_sums == 0, jnp.ones_like(mat), mat)
+    return mat
+
+  def __forward_emission_with_pred_alpha(
+      self,
+      transition_matrices: jnp.ndarray,
+      emission_matrix: jnp.ndarray,
+      pi: jnp.ndarray,
+      observations: jnp.ndarray,
+      actions: jnp.ndarray,
+  ):
+    """Forward scan that also stores pred_alpha at each step.
+
+    pred_alpha[t] is the forward message propagated through the transition for
+    action a[t-1] WITHOUT applying the emission observation at t.  It equals
+    P(h[t] | x[0..t-1], actions) and is used as the leave-one-out forward
+    factor in leave_one_out_slot_probs.
+
+    pred_alpha[0] = pi (no prior observations).
+
+    Returns
+    -------
+    log2_lik   : (T,) per-step log2 likelihoods
+    alpha      : (T, H) normalized forward messages (includes emission at each t)
+    pred_alpha : (T, H) forward messages *before* emission at each t
+    """
+    T_t = transition_matrices.transpose(0, 2, 1)
+    T = observations.shape[0]
+    pi_norm = pi / pi.sum()
+
+    alpha_0 = pi * emission_matrix[:, observations[0]]
+    p0 = alpha_0.sum()
+    alpha_0 = alpha_0 / jnp.where(p0 > 0, p0, 1.0)
+
+    def step(alpha_prev, n):
+      pred = jnp.dot(T_t[actions[n - 1]], alpha_prev)
+      s = pred.sum()
+      pred_norm = pred / jnp.where(s > 0, s, 1.0)
+      alpha_new = pred * emission_matrix[:, observations[n]]
+      p = alpha_new.sum()
+      alpha_new = alpha_new / jnp.where(p > 0, p, 1.0)
+      return alpha_new, (alpha_new, pred_norm, p)
+
+    _, (alphas, pred_alphas, ps) = jax.lax.scan(
+        step, alpha_0, jnp.arange(1, T)
+    )
+
+    all_alphas = jnp.concatenate([alpha_0[None], alphas], axis=0)       # (T, H)
+    all_pred_alphas = jnp.concatenate([pi_norm[None], pred_alphas], axis=0)  # (T, H)
+    all_ps = jnp.hstack([p0, ps])
+    return jnp.log2(all_ps), all_alphas, all_pred_alphas
+
+  def forward_backward_rebound(
+      self,
+      observations: np.ndarray,
+      actions: np.ndarray,
+      emission_vec: np.ndarray,
+  ) -> tuple[np.ndarray, np.ndarray, float]:
+    """Forward-backward under a (possibly rebound) emission vector.
+
+    Unlike the pmap-based training forward-backward, this runs on a single
+    device and accepts arbitrary-length probe sequences.
+
+    Parameters
+    ----------
+    observations : (T,) integer token ids
+    actions      : (T,) integer action ids
+    emission_vec : (H,) integer array — emission_vec[h] = token emitted by state h
+
+    Returns
+    -------
+    alpha  : (T, H) forward messages, normalized, forward-chronological order
+    beta   : (T, H) backward messages, normalized, forward-chronological order
+    loglik : float  (sum of per-step log2 likelihoods)
+    """
+    n_tokens = max(int(np.asarray(observations).max()) + 1, self._num_emissions)
+    emission_matrix = self._emission_vec_to_matrix(emission_vec, n_tokens=n_tokens)
+    obs_j = jnp.array(observations, dtype=jnp.int32)
+    act_j = jnp.array(actions, dtype=jnp.int32)
+
+    log2_lik, alpha, _ = self.__forward_emission_with_pred_alpha(
+        self._transition_matrix[0], emission_matrix,
+        self._pi_states[0], obs_j, act_j,
+    )
+    beta_rev = self.__backward_emission(
+        self._transition_matrix[0], emission_matrix, obs_j, act_j,
+    )
+    beta = jnp.flip(beta_rev, axis=0)
+    return np.array(alpha), np.array(beta), float(log2_lik.sum())
+
+  def leave_one_out_slot_probs(
+      self,
+      observations: np.ndarray,
+      actions: np.ndarray,
+      emission_vec: np.ndarray,
+  ) -> np.ndarray:
+    """Compute p(slot_n = j | x_{-n}, actions) for all positions n and slots j.
+
+    A 'slot' is a clone group (one token type).  The posterior marginalizes
+    over all clones within each group using the precomputed membership matrix.
+
+    Parameters
+    ----------
+    observations : (T,) integer token ids
+    actions      : (T,) integer action ids
+    emission_vec : (H,) integer emission assignment
+
+    Returns
+    -------
+    loo : (T, K) float32 array — loo[n, j] = P(slot_n = j | x_{-n}, actions)
+    """
+    n_tokens = max(int(np.asarray(observations).max()) + 1, self._num_emissions)
+    emission_matrix = self._emission_vec_to_matrix(emission_vec, n_tokens=n_tokens)
+    obs_j = jnp.array(observations, dtype=jnp.int32)
+    act_j = jnp.array(actions, dtype=jnp.int32)
+
+    _, alpha, pred_alpha = self.__forward_emission_with_pred_alpha(
+        self._transition_matrix[0], emission_matrix,
+        self._pi_states[0], obs_j, act_j,
+    )
+    beta_rev = self.__backward_emission(
+        self._transition_matrix[0], emission_matrix, obs_j, act_j,
+    )
+    beta = jnp.flip(beta_rev, axis=0)
+
+    # Joint LOO: pred_alpha[n] * beta[n], normalize per position
+    joint = pred_alpha * beta                                # (T, H)
+    norms = joint.sum(axis=1, keepdims=True)
+    joint = joint / jnp.where(norms > 0, norms, 1.0)
+
+    # Marginalize over clone groups → (T, K)
+    loo = joint @ self._membership_matrix                    # (T, K)
+    return np.array(loo)
+
+  def rebind(
+      self,
+      observations: np.ndarray,
+      actions: np.ndarray,
+      emission_vec: Optional[np.ndarray] = None,
+      p_surprise: float = 0.1,
+      n_iters: int = 1,
+  ) -> np.ndarray:
+    """Fast rebinding — Algorithm 1 from Swaminathan et al. 2023.
+
+    Identifies which schema slots should be rebound to new token assignments
+    based on leave-one-out slot posteriors over a probe sequence.  Works for
+    any number of actions.
+
+    Parameters
+    ----------
+    observations : (T,) probe token ids (may include tokens not seen at training)
+    actions      : (T,) probe action ids
+    emission_vec : (H,) initial emission assignment.  None = identity (slot j → j).
+    p_surprise   : confidence threshold θ for anchor / candidate detection
+    n_iters      : number of outer EM iterations
+
+    Returns
+    -------
+    emission_vec : (H,) rebound emission vector
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    K = self._num_emissions
+    T = len(observations)
+    offsets = np.hstack(([0], self._n_clones.cumsum()))     # (K+1,)
+
+    if emission_vec is None:
+      emission_vec = self.default_emission_vec.copy()
+    else:
+      emission_vec = np.array(emission_vec, dtype=np.int32).copy()
+
+    obs = np.asarray(observations, dtype=np.int32)
+    # Full vocab size: may be larger than K when probe uses novel tokens K..2K-1
+    K_full = max(int(obs.max()) + 1, K)
+    obs_onehot = np.zeros((T, K_full), dtype=np.float32)
+    obs_onehot[np.arange(T), obs] = 1.0                     # (T, K_full)
+
+    for _ in range(n_iters):
+      loo = self.leave_one_out_slot_probs(obs, actions, emission_vec)  # (T, K)
+
+      # Current emission token for each slot (one representative per group)
+      current_tok = emission_vec[offsets[:K]]               # (K,)
+
+      # Anchor detection — vectorized
+      # Slot j is an anchor if at some n: loo[n,j] > θ AND current_tok[j] == obs[n]
+      loo_confident = loo > p_surprise                      # (T, K)
+      correct = (obs[:, None] == current_tok[None, :])      # (T, K)
+      is_anchor_slot = np.any(loo_confident & correct, axis=0)   # (K,)
+      is_anchor_pos  = np.any(loo_confident & correct, axis=1)   # (T,)
+
+      # Affinity accumulation — fully vectorized
+      # affinity[j, k_full] = Σ_n loo[n,j] where obs[n]==k_full,
+      #                        non-anchor, confident, and slot j does not
+      #                        already emit k_full at that position
+      loo_active = loo * loo_confident.astype(np.float32)
+      loo_active[is_anchor_pos] = 0.0
+      loo_active[:, is_anchor_slot] = 0.0
+      loo_active *= (~correct).astype(np.float32)           # exclude already-correct pairs
+      affinity = loo_active.T @ obs_onehot                  # (K, K_full)
+
+      # Run linear assignment on non-anchor slots only
+      candidate_slots = np.where(~is_anchor_slot)[0]
+      if len(candidate_slots) == 0:
+        break
+      affinity_sub = affinity[candidate_slots]              # (n_cands, K_full)
+      if affinity_sub.max() == 0:
+        break
+
+      row_ind, col_ind = linear_sum_assignment(-affinity_sub)
+      for i, ci in zip(row_ind, col_ind):
+        if affinity_sub[i, ci] > 0:
+          j = int(candidate_slots[i])
+          emission_vec[offsets[j]:offsets[j + 1]] = ci
+
+    return emission_vec

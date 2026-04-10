@@ -1,0 +1,13 @@
+return the matrix transpose / [ [ KO DL ] [ QB KM ] ] [ [ KO QB ] [ DL KM ] ] /
+reverse the list / [ BN OY VD ] [ VD OY BN ] /
+find the element at index zero / [ NK CB GH FI NI ] [ NK ] /
+print the element at index one / [ JR GL AB RE DA ] [ GL ] /
+print the element at index two / [ CT AG ML RR EA BS ] [ ML ] /
+duplicate each list item / [ FP EZ AV ] [ FP FP EZ EZ AV AV ] /
+rotate the list elements one place forward / [ QY WP SU KL SM ] [ SM QY WP SU KL ] /
+print every other member in the list starting with the second member / [ MA NN UO ] [ NN ] /
+print every other member in the list starting with the first member / [ ID XZ ZE UT WG MK ] [ ID ZE WG ] /
+rotate the list elements one place backward / [ PR ZL UF ] [ ZL UF PR ] /
+return the matrix diagonal / [ [ VF ZD XM ] [ TD UN QN ] [ OT UC BG ] ] [ VF UN BG ] /
+roll the columns of the matrix to the right / [ [ DG TE ] [ ZX KI ] ] [ [ TE DG ] [ KI ZX ] ] /
+find the matrix element in the second row and second column / [ [ NE NH ] [ VV PK ] ] [ PK ] /  

@@ -1,0 +1,5 @@
+return the matrix transpose / [ [ ko dl ] [ qb km ] ] [ [ ko qb ] [ dl km ] ] / [ [ ko dl ] [ qb km ] ] [ [ ko qb ] [ dl km ] ] &
+reverse the list / [ bn oy vd ] [ vd oy bn ] / [ bn oy vd ] [ vd oy bn ] &
+find the element at index zero of the list / [ nk cb gh fi ni ] [ nk ] / [ nk cb gh fi ni ] [ nk ] &
+print the element at index one of the list / [ jr gl ab re da ] [ gl ] / [ jr gl ab re da ] [ gl ] &
+print the element at index two of the list / [ ct ag ml rr ea bs ] [ ml ] / [ ct ag ml rr ea bs ] [ ml ] &
